@@ -1,0 +1,4 @@
+tabula-py
+pytesseract>=0.3.10 
+groq==0.5.0
+PyMuPDF
