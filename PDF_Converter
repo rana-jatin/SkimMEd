@@ -1,0 +1,637 @@
+import os
+import sys
+from pathlib import Path
+import io
+import pandas as pd
+
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    print("PyMuPDF not installed. Install with: pip install PyMuPDF")
+    sys.exit(1)
+
+try:
+    from PIL import Image
+except ImportError:
+    print("Pillow not installed. Install with: pip install Pillow")
+    sys.exit(1)
+
+try:
+    import pytesseract
+except ImportError:
+    print("pytesseract not installed. Install with: pip install pytesseract")
+    sys.exit(1)
+
+try:
+    from groq import Groq
+except ImportError:
+    print("Groq not installed. Install with: pip install groq")
+    sys.exit(1)
+
+# Optional table extraction libraries
+try:
+    import tabula
+    TABULA_AVAILABLE = True
+except ImportError:
+    TABULA_AVAILABLE = False
+    print("Warning: tabula-py not installed. Advanced PDF table extraction disabled.")
+    print("Install with: pip install tabula-py")
+
+try:
+    import camelot
+    CAMELOT_AVAILABLE = True
+except ImportError:
+    CAMELOT_AVAILABLE = False
+    print("Warning: camelot-py not installed. High-quality PDF table extraction disabled.")
+    print("Install with: pip install 'camelot-py[cv]'")
+
+# Supported image formats
+SUPPORTED_IMAGE_FORMATS = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.gif', '.webp'}
+
+def setup_tesseract():
+    """
+    Setup Tesseract OCR (you may need to adjust the path based on your installation)
+    """
+    # Uncomment and modify the path below if Tesseract is not in your PATH
+    # Windows example:
+    # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    
+    # macOS example (if installed via Homebrew):
+    # pytesseract.pytesseract.tesseract_cmd = '/opt/homebrew/bin/tesseract'
+    
+    # Linux example:
+    # pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+    
+    pass
+
+def extract_text_from_pdf(pdf_path):
+    """
+    Extract regular text from PDF using PyMuPDF
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        text = ""
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text += f"\n--- Page {page_num + 1} ---\n"
+            text += page.get_text()
+        
+        doc.close()
+        return text
+    
+    except Exception as e:
+        print(f"Error extracting text from PDF: {e}")
+        return None
+
+def extract_tables_with_pymupdf(pdf_path):
+    """
+    Extract tables using PyMuPDF's built-in table detection
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        tables_text = ""
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            
+            # Find tables on the page
+            tables = page.find_tables()
+            
+            if tables:
+                tables_text += f"\n--- Tables from Page {page_num + 1} ---\n"
+                
+                for table_num, table in enumerate(tables):
+                    try:
+                        # Extract table data
+                        table_data = table.extract()
+                        
+                        tables_text += f"\nTable {table_num + 1}:\n"
+                        tables_text += format_table_data(table_data)
+                        tables_text += "\n"
+                        
+                    except Exception as e:
+                        print(f"Error extracting table {table_num + 1} from page {page_num + 1}: {e}")
+        
+        doc.close()
+        return tables_text
+    
+    except Exception as e:
+        print(f"Error extracting tables with PyMuPDF: {e}")
+        return ""
+
+def extract_tables_with_tabula(pdf_path):
+    """
+    Extract tables using tabula-py (if available)
+    """
+    if not TABULA_AVAILABLE:
+        return ""
+    
+    try:
+        # Read all tables from all pages
+        tables = tabula.read_pdf(pdf_path, pages='all', multiple_tables=True)
+        
+        tables_text = "\n=== TABLES EXTRACTED WITH TABULA ===\n"
+        
+        for i, table in enumerate(tables):
+            if not table.empty:
+                tables_text += f"\nTable {i + 1}:\n"
+                tables_text += table.to_string(index=False)
+                tables_text += "\n" + "="*50 + "\n"
+        
+        return tables_text
+    
+    except Exception as e:
+        print(f"Error extracting tables with Tabula: {e}")
+        return ""
+
+def extract_tables_with_camelot(pdf_path):
+    """
+    Extract tables using camelot-py (if available)
+    """
+    if not CAMELOT_AVAILABLE:
+        return ""
+    
+    try:
+        # Extract tables from all pages
+        tables = camelot.read_pdf(pdf_path, pages='all')
+        
+        tables_text = "\n=== TABLES EXTRACTED WITH CAMELOT ===\n"
+        
+        for i, table in enumerate(tables):
+            if not table.df.empty:
+                tables_text += f"\nTable {i + 1} (Accuracy: {table.accuracy:.2f}):\n"
+                tables_text += table.df.to_string(index=False)
+                tables_text += "\n" + "="*50 + "\n"
+        
+        return tables_text
+    
+    except Exception as e:
+        print(f"Error extracting tables with Camelot: {e}")
+        return ""
+
+def format_table_data(table_data):
+    """
+    Format extracted table data into readable text
+    """
+    if not table_data:
+        return "No table data found"
+    
+    formatted_text = ""
+    
+    # Convert to pandas DataFrame for better formatting
+    try:
+        df = pd.DataFrame(table_data)
+        
+        # Clean up the data
+        df = df.fillna('')  # Replace NaN with empty string
+        
+        # Convert to string representation
+        formatted_text = df.to_string(index=False, header=False)
+        
+    except Exception:
+        # Fallback to simple formatting
+        for row in table_data:
+            if row:  # Skip empty rows
+                formatted_text += " | ".join(str(cell) for cell in row) + "\n"
+    
+    return formatted_text
+
+def extract_images_from_pdf(pdf_path, output_dir="extracted_images"):
+    """
+    Extract images from PDF and save them
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        images_info = []
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            image_list = page.get_images()
+            
+            for img_index, img in enumerate(image_list):
+                xref = img[0]
+                pix = fitz.Pixmap(doc, xref)
+                
+                # Skip if image is too small (likely decorative)
+                if pix.width < 50 or pix.height < 50:
+                    pix = None
+                    continue
+                
+                # Convert CMYK to RGB if necessary
+                if pix.n - pix.alpha < 4:
+                    img_data = pix.tobytes("png")
+                else:
+                    pix1 = fitz.Pixmap(fitz.csRGB, pix)
+                    img_data = pix1.tobytes("png")
+                    pix1 = None
+                
+                # Save image
+                img_filename = f"page_{page_num + 1}_img_{img_index + 1}.png"
+                img_path = os.path.join(output_dir, img_filename)
+                
+                with open(img_path, "wb") as img_file:
+                    img_file.write(img_data)
+                
+                images_info.append({
+                    'page': page_num + 1,
+                    'index': img_index + 1,
+                    'path': img_path,
+                    'width': pix.width,
+                    'height': pix.height
+                })
+                
+                pix = None
+        
+        doc.close()
+        return images_info
+    
+    except Exception as e:
+        print(f"Error extracting images from PDF: {e}")
+        return []
+
+def perform_ocr_on_image(image_path, lang='eng', detect_tables=True):
+    """
+    Perform OCR on a single image using Tesseract with table detection
+    """
+    try:
+        # Open and process the image
+        image = Image.open(image_path)
+        
+        # Convert to RGB if necessary
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Regular OCR
+        text = pytesseract.image_to_string(image, lang=lang)
+        
+        # Table-specific OCR if requested
+        if detect_tables:
+            try:
+                # Use PSM (Page Segmentation Mode) optimized for tables
+                table_config = f'--psm 6 -l {lang}'  # PSM 6: Uniform block of text
+                table_text = pytesseract.image_to_string(image, config=table_config)
+                
+                # Also try TSV output for better table structure
+                tsv_data = pytesseract.image_to_data(image, config=f'-l {lang}', output_type=pytesseract.Output.DICT)
+                
+                # Process TSV data to detect table-like structures
+                table_structure = process_tsv_for_tables(tsv_data)
+                
+                if table_structure:
+                    text += "\n\n--- DETECTED TABLE STRUCTURE ---\n"
+                    text += table_structure
+                
+            except Exception as e:
+                print(f"Table detection failed for {image_path}: {e}")
+        
+        return text.strip()
+    
+    except Exception as e:
+        print(f"Error performing OCR on {image_path}: {e}")
+        return ""
+
+def process_tsv_for_tables(tsv_data):
+    """
+    Process Tesseract TSV output to detect and format table structures
+    """
+    try:
+        # Group text by line and word positions
+        lines = {}
+        
+        for i in range(len(tsv_data['text'])):
+            if tsv_data['conf'][i] > 30:  # Only use confident detections
+                top = tsv_data['top'][i]
+                text = tsv_data['text'][i].strip()
+                
+                if text:  # Skip empty text
+                    # Group by approximate line (with tolerance)
+                    line_key = top // 10 * 10  # Group within 10 pixels
+                    
+                    if line_key not in lines:
+                        lines[line_key] = []
+                    
+                    lines[line_key].append({
+                        'text': text,
+                        'left': tsv_data['left'][i],
+                        'top': top,
+                        'width': tsv_data['width'][i]
+                    })
+        
+        # Sort lines by vertical position
+        sorted_lines = sorted(lines.items())
+        
+        # Format as table if structure detected
+        table_text = ""
+        for line_top, words in sorted_lines:
+            # Sort words by horizontal position
+            words.sort(key=lambda x: x['left'])
+            
+            # Join words with appropriate spacing
+            line_text = " | ".join(word['text'] for word in words)
+            table_text += line_text + "\n"
+        
+        return table_text if table_text.strip() else ""
+    
+    except Exception as e:
+        print(f"Error processing TSV data: {e}")
+        return ""
+
+def process_images_with_ocr(images_info, lang='eng', detect_tables=True):
+    """
+    Process extracted images with OCR and table detection
+    """
+    ocr_text = ""
+    
+    for img_info in images_info:
+        print(f"Processing OCR for {img_info['path']}...")
+        
+        text = perform_ocr_on_image(img_info['path'], lang, detect_tables)
+        
+        if text:
+            ocr_text += f"\n--- OCR from Page {img_info['page']}, Image {img_info['index']} ---\n"
+            ocr_text += text + "\n"
+    
+    return ocr_text
+
+def process_standalone_image(image_path, lang='eng', detect_tables=True):
+    """
+    Process a standalone image file with OCR and table detection
+    """
+    try:
+        print(f"Processing standalone image: {image_path}")
+        text = perform_ocr_on_image(image_path, lang, detect_tables)
+        
+        if text:
+            return f"--- OCR from {os.path.basename(image_path)} ---\n{text}\n"
+        else:
+            return f"--- No text found in {os.path.basename(image_path)} ---\n"
+    
+    except Exception as e:
+        print(f"Error processing standalone image {image_path}: {e}")
+        return ""
+
+def clean_text_with_groq(text, groq_api_key, model="mixtral-8x7b-32768"):
+    """
+    Use Groq to clean/enhance the extracted text including tables
+    """
+    try:
+        client = Groq(api_key=groq_api_key)
+        
+        # Split text into chunks if it's too long
+        max_chunk_size = 4000
+        chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
+        
+        cleaned_chunks = []
+        
+        for i, chunk in enumerate(chunks):
+            print(f"Processing chunk {i+1}/{len(chunks)} with Groq...")
+            
+            chat_completion = client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """Clean up this extracted text from PDF/OCR. 
+                        - Remove extra whitespace and fix formatting issues
+                        - Correct OCR errors while preserving original meaning
+                        - For tables: align columns properly and ensure readability
+                        - Fix table borders and spacing
+                        - Preserve all data while making it more readable
+                        - Convert poorly formatted tables to proper markdown tables when possible"""
+                    },
+                    {
+                        "role": "user",
+                        "content": chunk
+                    }
+                ],
+                model=model,
+                temperature=0.1,
+                max_tokens=4000
+            )
+            
+            cleaned_chunks.append(chat_completion.choices[0].message.content)
+        
+        return "\n".join(cleaned_chunks)
+    
+    except Exception as e:
+        print(f"Error processing text with Groq: {e}")
+        return text
+
+def save_text_to_file(text, output_path):
+    """
+    Save text to a file
+    """
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        print(f"Text saved to: {output_path}")
+        return True
+    except Exception as e:
+        print(f"Error saving text to file: {e}")
+        return False
+
+def document_to_text_converter(input_path, output_path=None, extract_images=True, 
+                             extract_tables=True, table_method='all', use_ocr=True, 
+                             ocr_lang='eng', detect_tables_in_images=True, use_groq=False, 
+                             groq_api_key=None, groq_model="mixtral-8x7b-32768"):
+    """
+    Main function to convert PDF or image to text with table extraction
+    
+    Args:
+        input_path (str): Path to the PDF or image file
+        output_path (str): Path for the output text file
+        extract_images (bool): Whether to extract images from PDF
+        extract_tables (bool): Whether to extract tables from PDF
+        table_method (str): Table extraction method ('pymupdf', 'tabula', 'camelot', 'all')
+        use_ocr (bool): Whether to use OCR on images
+        ocr_lang (str): Language for OCR (default: 'eng')
+        detect_tables_in_images (bool): Whether to detect tables in images via OCR
+        use_groq (bool): Whether to use Groq for text enhancement
+        groq_api_key (str): Groq API key
+        groq_model (str): Groq model to use
+    """
+    
+    # Setup Tesseract
+    setup_tesseract()
+    
+    # Validate input file exists
+    if not os.path.exists(input_path):
+        print(f"Input file not found: {input_path}")
+        return False
+    
+    # Generate output path if not provided
+    if output_path is None:
+        input_name = Path(input_path).stem
+        output_path = f"{input_name}_converted.txt"
+    
+    # Get file extension
+    file_ext = Path(input_path).suffix.lower()
+    
+    all_text = ""
+    
+    # Process based on file type
+    if file_ext == '.pdf':
+        print(f"Processing PDF: {input_path}")
+        
+        # Extract regular text from PDF
+        pdf_text = extract_text_from_pdf(input_path)
+        if pdf_text:
+            all_text += "=== EXTRACTED TEXT FROM PDF ===\n"
+            all_text += pdf_text + "\n\n"
+        
+        # Extract tables if requested
+        if extract_tables:
+            print("Extracting tables from PDF...")
+            
+            if table_method in ['pymupdf', 'all']:
+                pymupdf_tables = extract_tables_with_pymupdf(input_path)
+                if pymupdf_tables:
+                    all_text += "=== TABLES (PyMuPDF) ===\n"
+                    all_text += pymupdf_tables + "\n\n"
+            
+            if table_method in ['tabula', 'all'] and TABULA_AVAILABLE:
+                tabula_tables = extract_tables_with_tabula(input_path)
+                if tabula_tables:
+                    all_text += tabula_tables + "\n\n"
+            
+            if table_method in ['camelot', 'all'] and CAMELOT_AVAILABLE:
+                camelot_tables = extract_tables_with_camelot(input_path)
+                if camelot_tables:
+                    all_text += camelot_tables + "\n\n"
+        
+        # Extract and process images if requested
+        if extract_images and use_ocr:
+            print("Extracting images from PDF...")
+            images_info = extract_images_from_pdf(input_path)
+            
+            if images_info:
+                print(f"Found {len(images_info)} images in PDF")
+                ocr_text = process_images_with_ocr(images_info, ocr_lang, detect_tables_in_images)
+                
+                if ocr_text:
+                    all_text += "=== OCR TEXT FROM IMAGES ===\n"
+                    all_text += ocr_text + "\n\n"
+    
+    elif file_ext in SUPPORTED_IMAGE_FORMATS:
+        print(f"Processing image: {input_path}")
+        
+        if use_ocr:
+            image_text = process_standalone_image(input_path, ocr_lang, detect_tables_in_images)
+            all_text += "=== OCR TEXT FROM IMAGE ===\n"
+            all_text += image_text + "\n\n"
+        else:
+            print("OCR is disabled. No text extracted from image.")
+            return False
+    
+    else:
+        print(f"Unsupported file format: {file_ext}")
+        print(f"Supported formats: PDF, {', '.join(SUPPORTED_IMAGE_FORMATS)}")
+        return False
+    
+    if not all_text.strip():
+        print("No text was extracted from the input file.")
+        return False
+    
+    print(f"Extracted {len(all_text)} characters total")
+    
+    # Optionally process with Groq
+    final_text = all_text
+    if use_groq:
+        if groq_api_key is None:
+            print("Groq API key required when use_groq=True")
+            return False
+        
+        print("Enhancing text with Groq...")
+        final_text = clean_text_with_groq(all_text, groq_api_key, groq_model)
+    
+    # Save to file
+    success = save_text_to_file(final_text, output_path)
+    
+    if success:
+        print(f"Conversion completed successfully!")
+        print(f"Output file: {output_path}")
+        print(f"Final text length: {len(final_text)} characters")
+    
+    return success
+
+# Example usage
+if __name__ == "__main__":
+    # Configuration
+    INPUT_FILE = "your_document.pdf"  # Can be PDF or image file
+    OUTPUT_FILE = "converted_text.txt"
+    EXTRACT_IMAGES = True  # Extract images from PDF
+    EXTRACT_TABLES = True  # Extract tables from PDF
+    TABLE_METHOD = 'all'  # 'pymupdf', 'tabula', 'camelot', 'all'
+    USE_OCR = True  # Use OCR on images
+    OCR_LANGUAGE = 'eng'  # OCR language
+    DETECT_TABLES_IN_IMAGES = True  # Detect tables in images
+    USE_GROQ = False  # Set to True to use Groq for text enhancement
+    GROQ_API_KEY = "your_groq_api_key_here"
+    GROQ_MODEL = "mixtral-8x7b-32768"
+    
+    # Convert document to text
+    success = document_to_text_converter(
+        input_path=INPUT_FILE,
+        output_path=OUTPUT_FILE,
+        extract_images=EXTRACT_IMAGES,
+        extract_tables=EXTRACT_TABLES,
+        table_method=TABLE_METHOD,
+        use_ocr=USE_OCR,
+        ocr_lang=OCR_LANGUAGE,
+        detect_tables_in_images=DETECT_TABLES_IN_IMAGES,
+        use_groq=USE_GROQ,
+        groq_api_key=GROQ_API_KEY if USE_GROQ else None,
+        groq_model=GROQ_MODEL
+    )
+    
+    if success:
+        print("Document conversion completed!")
+    else:
+        print("Document conversion failed!")
+
+def main():
+    """Command line interface"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Convert PDF/Image to text with table extraction, OCR and Groq enhancement')
+    parser.add_argument('input_path', help='Path to the PDF or image file')
+    parser.add_argument('output_path', nargs='?', help='Output text file path')
+    parser.add_argument('--no-images', action='store_true', help='Skip image extraction from PDF')
+    parser.add_argument('--no-tables', action='store_true', help='Skip table extraction from PDF')
+    parser.add_argument('--table-method', choices=['pymupdf', 'tabula', 'camelot', 'all'], 
+                       default='all', help='Table extraction method')
+    parser.add_argument('--no-ocr', action='store_true', help='Skip OCR processing')
+    parser.add_argument('--no-table-detection', action='store_true', help='Skip table detection in images')
+    parser.add_argument('--ocr-lang', default='eng', help='OCR language (default: eng)')
+    parser.add_argument('--use-groq', action='store_true', help='Use Groq to enhance extracted text')
+    parser.add_argument('--api-key', help='Groq API key')
+    parser.add_argument('--model', default='mixtral-8x7b-32768', help='Groq model to use')
+    
+    args = parser.parse_args()
+    
+    # Use Groq API key from environment if not provided
+    groq_api_key = args.api_key or os.getenv('GROQ_API_KEY')
+    
+    if args.use_groq and not groq_api_key:
+        print("Groq API key required. Set GROQ_API_KEY environment variable or use --api-key")
+        sys.exit(1)
+    
+    success = document_to_text_converter(
+        input_path=args.input_path,
+        output_path=args.output_path,
+        extract_images=not args.no_images,
+        extract_tables=not args.no_tables,
+        table_method=args.table_method,
+        use_ocr=not args.no_ocr,
+        ocr_lang=args.ocr_lang,
+        detect_tables_in_images=not args.no_table_detection,
+        use_groq=args.use_groq,
+        groq_api_key=groq_api_key,
+        groq_model=args.model
+    )
+    
+    sys.exit(0 if success else 1)
+
